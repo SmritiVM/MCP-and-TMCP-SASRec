@@ -32,4 +32,4 @@ All datasets utilized are publically available on kaggle:
 - Scikit-learn version: 1.2.2
 
 ## Running the Code
-The code was tested on Kaggle using the GPU T4x2 accelerator. To replicate this setup, you can either configure a similar environment locally or upload the provided notebooks to Kaggle and run them there by modifying the dataset and associated files accordingly.
+The code was tested on Kaggle using the GPU T4x2 accelerator. To replicate this setup, you can either configure a similar environment locally or upload the provided notebooks ```mcp_sasrec.ipynb``` ```tmcp_sasrec.ipynb``` to Kaggle and run them there by modifying the dataset and associated files accordingly.
