@@ -5,20 +5,17 @@ Convolution-Based Semantic and Sequential Hybrid Relations"
 ## Overview
 Recommendation systems play a crucial role in industries such as e-commerce, education and entertainment, offering personalized and intelligent suggestions based on a user’s preferences. Sequential recommendation systems take into account a series of a user’s historical actions to predict the next interaction. Existing sequential recommendation systems primarily rely on sequential item relations without effectively integrating the semantic and temporal relations between items. This paper introduces MCP\_SASRec and its temporal variant TMCP\_SASRec, two novel frameworks for sequential recommendation to construct a sequentially, semantically and temporally rich hybrid matrix utilizing \textbf{M}arkov State Transition probabilities, \textbf{C}osine similarity, \textbf{P}ersonalized PageRank(PPR) based normalization and \textbf{T}emporal information. The constructed hybrid matrix is smoothened using a graph convolution (GCN) operation to generate item embeddings that can be passed to the transformer-based sequential recommendation model SASRec for next-item prediction. Experimental results show that MCP\_SASRec and TMCP\_SASRec outperform the state-of-the-art-models achieving 2-10\% improvement in evaluation metrics like Hit Ratio (HR), Normalized Discounted Cumulative Gain(NDCG) and Mean Reciprocal Rank(MRR), showcasing its effectiveness and utility.
 
-<figure>
-  <img
+
+Proposed MCP framework with Markov State Transition probabilities, Cosine Similarity and PPR-based normalization
+<img
   src="mcp-block.png"
   alt="MCP block diagram">
-  <figcaption>Proposed MCP framework with Markov State Transition probabilities, Cosine Similarity and PPR-based normalization</figcaption>
-</figure>
 
-<figure>
-  <img
+
+Proposed TMCP framework with additional time decay weighting and temporal GCN operations
+<img
   src="tmcp-block.png"
   alt="TMCP block diagram">
-  <figcaption>Proposed TMCP framework with additional time decay weighting and temporal GCN operations<figcaption>
-</figure>
-
 
 ## Datasets
 All datasets utilized are publically available on kaggle:
