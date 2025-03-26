@@ -24,6 +24,9 @@ All datasets utilized are publically available on kaggle:
 - [Yelp](https://www.kaggle.com/datasets/yelp-dataset/yelp-dataset)
 - [Amazon Beauty](https://www.kaggle.com/datasets/smritimadangarli/amazon-beauty/data)
 
+
+[Gdrive](https://drive.google.com/drive/folders/1MAVfVrueuk8NhqLq4LW_OT2qd8NkEBAF?usp=sharing)
+
 ## Requirements
 - Python version: 3.10.12 
 - NumPy version: 1.26.4
@@ -33,3 +36,5 @@ All datasets utilized are publically available on kaggle:
 
 ## Running the Code
 The code was tested on Kaggle using the GPU T4x2 accelerator. To replicate this setup, you can either configure a similar environment locally or upload the provided notebooks ```mcp_sasrec.ipynb``` ```tmcp_sasrec.ipynb``` to Kaggle and run them there by modifying the dataset and associated files accordingly.
+
+To run the executable files locally use ```python mcp_sasrec.py --dataset-path='<insert path here>'``` or ```python tmcp_sasrec.py --dataset-path='<insert path here>'```
