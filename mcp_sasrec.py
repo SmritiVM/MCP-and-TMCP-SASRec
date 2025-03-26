@@ -1,0 +1,648 @@
+# %%
+import numpy as np
+import pandas as pd
+import torch
+import warnings
+import argparse
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset-path')
+args = parser.parse_args()
+warnings.filterwarnings("ignore")
+
+"""
+### Semantic Matrix Creation
+"""
+movies = pd.read_csv(f'{args.dataset_path}/movies.csv')
+ratings = pd.read_csv(f'{args.dataset_path}/ratings.csv')
+
+ratings_movie_ids = ratings['movieId'].unique()
+filtered_movies = movies[movies['movieId'].isin(ratings_movie_ids)]
+filtered_movies['movieId'].nunique()
+
+movie_id_to_index = {movie_id: idx + 1 for idx, movie_id in enumerate(filtered_movies['movieId'])}
+filtered_movies['movieId'] = filtered_movies['movieId'].copy().map(movie_id_to_index)
+
+filtered_movies['genres'] = filtered_movies['genres'].str.split('|')
+filtered_movies['genres'] = filtered_movies['genres'].fillna('').astype('str')
+filtered_movies.head()
+
+# %%
+def tf_idf_matrix(movies_dataset):
+    tf_idf = TfidfVectorizer(analyzer = 'word', ngram_range=(1,1), min_df=0)
+    tfidf_matrix = tf_idf.fit_transform(movies_dataset['genres'])
+    return tfidf_matrix
+tf_matrix = tf_idf_matrix(filtered_movies)
+tf_matrix.shape[0]
+
+def cosine_similarity(matrix):
+    _cosine = linear_kernel(matrix, matrix)
+    return _cosine
+cosine_matrix = cosine_similarity(tf_matrix)
+"""
+### Sequential Matrix Creation
+"""
+
+ratings['movieId'] = ratings['movieId'].copy().map(movie_id_to_index)
+sorted_ratings = ratings.sort_values(by=['userId', 'timestamp'])
+sorted_ratings.head()
+
+
+from collections import defaultdict
+transitions = defaultdict(int)
+for user, group in sorted_ratings.groupby('userId'):
+    movies = group['movieId'].tolist()
+    for i in range(len(movies) - 1):
+        transitions[(movies[i], movies[i + 1])] += 1
+
+transition_matrix = defaultdict(dict)
+movie_counts = defaultdict(int)
+
+for (movie_i, movie_j), count in transitions.items():
+    movie_counts[movie_i] += count
+
+for (movie_i, movie_j), count in transitions.items():
+    transition_matrix[movie_i][movie_j] = count / movie_counts[movie_i]
+
+unique_movies = sorted(set(sorted_ratings['movieId']))
+movie_to_idx = {movie: idx for idx, movie in enumerate(unique_movies)}
+n_movies = len(unique_movies)
+
+sequential_matrix = np.zeros((n_movies, n_movies))
+for movie_i, neighbors in transition_matrix.items():
+    for movie_j, prob in neighbors.items():
+        sequential_matrix[movie_to_idx[movie_i], movie_to_idx[movie_j]] = prob
+
+"""
+### Generation of a sequence array for SASRec training
+"""
+
+filtered_ratings = sorted_ratings[['userId', 'movieId']].copy()
+ratings_array = filtered_ratings.to_numpy(dtype=np.int32)
+
+num_users = filtered_ratings['userId'].nunique()
+num_items = filtered_ratings['movieId'].nunique()
+
+print(f"Number of Users: {num_users}")
+print(f"Number of Items (Movies): {num_items}")
+
+
+"""
+### Hybrid Matrix Construction
+"""
+
+# %%
+alpha = 1
+beta = 1
+hybrid_matrix = alpha * sequential_matrix + beta * cosine_matrix
+hybrid_matrix
+
+"""
+## GCN
+"""
+
+def normalize_adjacency(adj):
+    degree = torch.sum(adj, dim=1, keepdim=True)
+    degree_inv_sqrt = torch.pow(degree, -0.5)
+    adj_normalized = degree_inv_sqrt * adj * degree_inv_sqrt.t()
+    return adj_normalized
+
+def personalized_ppr(adj, alpha=0.1, max_iter=10, tol=1e-6):
+    num_nodes = adj.shape[0]
+    adj_norm = normalize_adjacency(adj)
+    ppr_matrix = torch.eye(num_nodes, device=adj.device)
+    for _ in range(max_iter):
+        new_ppr = alpha * torch.eye(num_nodes, device=adj.device) + (1 - alpha) * torch.mm(adj_norm, ppr_matrix)
+        if torch.norm(new_ppr - ppr_matrix) < tol:
+            break
+        ppr_matrix = new_ppr
+    
+    return ppr_matrix
+
+alpha_ppr = 0.1
+adj_matrix = torch.tensor(hybrid_matrix, dtype=torch.float32, device=device)
+adj_matrix = personalized_ppr(adj_matrix, alpha_ppr)
+
+num_movies = adj_matrix.shape[0]
+padding_row = torch.zeros((1, num_movies), device=device)
+adj_matrix = torch.cat([adj_matrix, padding_row], dim=0)
+padding_col = torch.zeros((num_movies + 1, 1), device=device)
+adj_matrix = torch.cat([adj_matrix, padding_col], dim=1)
+
+
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+class GCNLayer(nn.Module):
+    def __init__(self, in_features, out_features, alpha=0.1):
+        super(GCNLayer, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.alpha = alpha
+
+    def forward(self, x, adj):
+        device = adj.device
+        x = x.to(device)
+        propagated = torch.mm(adj, x)
+        x = self.alpha * x + (1 - self.alpha) * propagated
+        x = self.linear(x)
+        return F.relu(x)
+
+"""
+## SASRec
+"""
+
+"""
+### Preprocess
+"""
+
+import random
+from collections import defaultdict
+from multiprocessing import Process, Queue
+
+def build_index(ui_mat):
+    n_users = ui_mat[:,0].max()
+    n_items = ui_mat[:,1].max()
+
+    u2i_index = [[] for _ in range(n_users + 1)]
+    i2u_index = [[] for _ in range(n_items + 1)]
+
+    for ui_pair in ui_mat:
+        u2i_index[ui_pair[0]].append(ui_pair[1])
+        i2u_index[ui_pair[1]].append(ui_pair[0])
+
+    return u2i_index, i2u_index
+
+def random_neq(l, r, s):
+    t = np.random.randint(l, r)
+    while t in s:
+        t = np.random.randint(l, r)
+    return t
+
+def sample_function(user_train, usernum, itemnum, batch_size, maxlen, result_queue, SEED):
+    def sample(uid):
+        while len(user_train[uid]) <= 1: uid = np.random.randint(1, usernum + 1)
+
+        seq = np.zeros([maxlen], dtype=np.int32)
+        pos = np.zeros([maxlen], dtype=np.int32)
+        neg = np.zeros([maxlen], dtype=np.int32)
+        nxt = user_train[uid][-1]
+        idx = maxlen - 1
+
+        ts = set(user_train[uid])
+        for i in reversed(user_train[uid][:-1]):
+            seq[idx] = i
+            pos[idx] = nxt
+            if nxt != 0: neg[idx] = random_neq(1, itemnum + 1, ts)
+            nxt = i
+            idx -= 1
+            if idx == -1: break
+
+        return (uid, seq, pos, neg)
+
+    np.random.seed(SEED)
+    uids = np.arange(1, usernum+1, dtype=np.int32)
+    counter = 0
+    while True:
+        if counter % usernum == 0:
+            np.random.shuffle(uids)
+        one_batch = []
+        for i in range(batch_size):
+            one_batch.append(sample(uids[counter % usernum]))
+            counter += 1
+        result_queue.put(zip(*one_batch))
+
+
+class WarpSampler(object):
+    def __init__(self, User, usernum, itemnum, batch_size=64, maxlen=10, n_workers=1):
+        self.result_queue = Queue(maxsize=n_workers * 10)
+        self.processors = []
+        for i in range(n_workers):
+            self.processors.append(
+                Process(target=sample_function, args=(User,
+                                                      usernum,
+                                                      itemnum,
+                                                      batch_size,
+                                                      maxlen,
+                                                      self.result_queue,
+                                                      np.random.randint(2e9)
+                                                      )))
+            self.processors[-1].daemon = True
+            self.processors[-1].start()
+
+    def next_batch(self):
+        return self.result_queue.get()
+
+    def close(self):
+        for p in self.processors:
+            p.terminate()
+            p.join()
+
+
+def data_partition(df):
+    usernum = 0
+    itemnum = 0
+    User = defaultdict(list)
+    user_train = {}
+    user_valid = {}
+    user_test = {}
+    for index, row in df.iterrows():
+        u = row[0]  
+        i = row[1]  
+        u = int(u)
+        i = int(i)
+        usernum = max(u, usernum)
+        itemnum = max(i, itemnum)
+        User[u].append(i)
+
+    for user in User:
+        nfeedback = len(User[user])
+        if nfeedback < 3:
+            user_train[user] = User[user]
+            user_valid[user] = []
+            user_test[user] = []
+        else:
+            user_train[user] = User[user][:-2]
+            user_valid[user] = []
+            user_valid[user].append(User[user][-2])
+            user_test[user] = []
+            user_test[user].append(User[user][-1])
+    return [user_train, user_valid, user_test, usernum, itemnum]
+
+# %%
+import copy
+import random
+import numpy as np
+
+def evaluate(model, dataset, args):
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    NDCG = 0.0
+    HT = 0.0
+    MRR = 0.0
+    valid_user = 0.0
+
+    if usernum > 10000:
+        users = random.sample(range(1, usernum + 1), 10000)
+    else:
+        users = range(1, usernum + 1)
+    
+    for u in users:
+        if len(train[u]) < 1 or len(test[u]) < 1: continue
+
+        seq = np.zeros([args['maxlen']], dtype=np.int32)
+        idx = args['maxlen'] - 1
+        seq[idx] = valid[u][0]
+        idx -= 1
+        for i in reversed(train[u]):
+            seq[idx] = i
+            idx -= 1
+            if idx == -1: break
+        rated = set(train[u])
+        rated.add(0)
+        item_idx = [test[u][0]]
+        for _ in range(100):
+            t = np.random.randint(1, itemnum + 1)
+            while t in rated: t = np.random.randint(1, itemnum + 1)
+            item_idx.append(t)
+
+        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
+        predictions = predictions[0]  
+
+        rank = predictions.argsort().argsort()[0].item()
+
+        valid_user += 1
+
+        if rank < 10:
+            NDCG += 1 / np.log2(rank + 2)
+            HT += 1
+            MRR += 1 / (rank + 1)  
+
+    return NDCG / valid_user, HT / valid_user, MRR / valid_user
+
+
+def evaluate_valid(model, dataset, args):
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    NDCG = 0.0
+    HT = 0.0
+    MRR = 0.0 
+    valid_user = 0.0
+    if usernum > 10000:
+        users = random.sample(range(1, usernum + 1), 10000)
+    else:
+        users = range(1, usernum + 1)
+    
+    for u in users:
+        if len(train[u]) < 1 or len(valid[u]) < 1: continue
+
+        seq = np.zeros([args['maxlen']], dtype=np.int32)
+        idx = args['maxlen'] - 1
+        for i in reversed(train[u]):
+            seq[idx] = i
+            idx -= 1
+            if idx == -1: break
+
+        rated = set(train[u])
+        rated.add(0)
+        item_idx = [valid[u][0]]
+        for _ in range(100):
+            t = np.random.randint(1, itemnum + 1)
+            while t in rated: t = np.random.randint(1, itemnum + 1)
+            item_idx.append(t)
+
+        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
+        predictions = predictions[0]
+
+        rank = predictions.argsort().argsort()[0].item()
+
+        valid_user += 1
+
+        if rank < 10:
+            NDCG += 1 / np.log2(rank + 2)
+            HT += 1
+            MRR += 1 / (rank + 1)
+
+    return NDCG / valid_user, HT / valid_user, MRR / valid_user
+
+"""
+### Model
+"""
+
+class PointWiseFeedForward(torch.nn.Module):
+    def __init__(self, hidden_units, dropout_rate):
+        super(PointWiseFeedForward, self).__init__()
+
+        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
+        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
+        self.relu = torch.nn.ReLU()
+        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
+        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
+
+    def forward(self, inputs):
+        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
+        outputs = outputs.transpose(-1, -2) 
+        outputs += inputs
+        return outputs
+
+
+class SASRec(torch.nn.Module):
+    def __init__(self, user_num, item_num, args, adj_matrix):
+        super(SASRec, self).__init__()
+
+        self.user_num = user_num
+        self.item_num = item_num
+        self.dev = args['device']
+
+        self.gcn_layers = nn.ModuleList([
+            GCNLayer(args['hidden_units'], args['hidden_units']) 
+            for _ in range(args['num_gcn_layers'])
+        ])
+
+        self.adj_matrix = adj_matrix
+        self.item_emb = torch.nn.Embedding(item_num + 1, args['hidden_units'], padding_idx=0)
+
+        self.layer_agg = None
+        
+        self.pos_emb = torch.nn.Embedding(args['maxlen']+1, args['hidden_units'], padding_idx=0)
+        self.emb_dropout = torch.nn.Dropout(p=args['dropout_rate'])
+
+        self.attention_layernorms = torch.nn.ModuleList() 
+        self.attention_layers = torch.nn.ModuleList()
+        self.forward_layernorms = torch.nn.ModuleList()
+        self.forward_layers = torch.nn.ModuleList()
+
+        self.last_layernorm = torch.nn.LayerNorm(args['hidden_units'], eps=1e-8)
+
+        for _ in range(args['num_blocks']):
+            new_attn_layernorm = torch.nn.LayerNorm(args['hidden_units'], eps=1e-8)
+            self.attention_layernorms.append(new_attn_layernorm)
+
+            new_attn_layer = torch.nn.MultiheadAttention(args['hidden_units'],
+                                                          args['num_heads'],
+                                                          args['dropout_rate'])
+            self.attention_layers.append(new_attn_layer)
+
+            new_fwd_layernorm = torch.nn.LayerNorm(args['hidden_units'], eps=1e-8)
+            self.forward_layernorms.append(new_fwd_layernorm)
+
+            new_fwd_layer = PointWiseFeedForward(args['hidden_units'], args['dropout_rate'])
+            self.forward_layers.append(new_fwd_layer)
+            
+    def get_graph_embeddings(self):
+        layer_output = F.embedding(torch.arange(self.item_num+1, device=self.dev), self.item_emb.weight)
+
+        for gcn_layer in self.gcn_layers:
+            layer_output = gcn_layer(layer_output, self.adj_matrix)
+
+        return layer_output
+        
+        
+    def log2feats(self, log_seqs):
+
+        item_embeddings = self.get_graph_embeddings()
+        seqs = F.embedding(torch.LongTensor(log_seqs).to(self.dev), item_embeddings)
+        
+        seqs *= self.item_emb.embedding_dim ** 0.5
+        poss = np.tile(np.arange(1, log_seqs.shape[1] + 1), [log_seqs.shape[0], 1])
+        poss *= (log_seqs != 0)
+        seqs += self.pos_emb(torch.LongTensor(poss).to(self.dev))
+        seqs = self.emb_dropout(seqs)
+
+        tl = seqs.shape[1] 
+        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=self.dev))
+
+        for i in range(len(self.attention_layers)):
+            seqs = torch.transpose(seqs, 0, 1)
+            Q = self.attention_layernorms[i](seqs)
+            mha_outputs, _ = self.attention_layers[i](Q, seqs, seqs,
+                                                      attn_mask=attention_mask)
+            seqs = Q + mha_outputs
+            seqs = torch.transpose(seqs, 0, 1)
+
+            seqs = self.forward_layernorms[i](seqs)
+            seqs = self.forward_layers[i](seqs)
+
+        log_feats = self.last_layernorm(seqs)
+
+        return log_feats
+
+    def forward(self, user_ids, log_seqs, pos_seqs, neg_seqs):
+        log_feats = self.log2feats(log_seqs)
+
+        item_embeddings = self.get_graph_embeddings()
+        pos_embs = self.item_emb(torch.LongTensor(pos_seqs).to(self.dev))
+        neg_embs = self.item_emb(torch.LongTensor(neg_seqs).to(self.dev))
+
+        pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        neg_logits = (log_feats * neg_embs).sum(dim=-1)
+
+        return pos_logits, neg_logits 
+
+    def predict(self, user_ids, log_seqs, item_indices): 
+        log_feats = self.log2feats(log_seqs)
+
+        final_feat = log_feats[:, -1, :] 
+
+        item_embs = self.item_emb(torch.LongTensor(item_indices).to(self.dev))
+        logits = item_embs.matmul(final_feat.unsqueeze(-1)).squeeze(-1)
+
+        return logits
+
+
+# %%
+"""
+## Main
+"""
+
+u2i_index, i2u_index = build_index(ratings_array)
+dataset = data_partition(filtered_ratings)
+[user_train, user_valid, user_test, usernum, itemnum] = dataset
+
+args = {
+    'batch_size': 128,
+    'lr': 0.001,
+    'maxlen': 50,
+    'hidden_units': 50,
+    'num_blocks': 2,
+    'num_epochs': 200,
+    'num_heads': 1,
+    'dropout_rate': 0.2,
+    'l2_emb': 0.0,
+    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    'inference_only': False,
+    'num_gcn_layers': 1
+}
+
+num_batch = (len(user_train) - 1) // args['batch_size'] + 1
+cc = 0.0
+for u in user_train:
+    cc += len(user_train[u])
+print('Average sequence length: %.2f' % (cc / len(user_train)))
+
+# %%
+sampler = WarpSampler(user_train, usernum, itemnum, batch_size=args['batch_size'], maxlen=args['maxlen'], n_workers=3)
+model = SASRec(usernum, itemnum, args, adj_matrix).to(args['device'])
+
+for name, param in model.named_parameters():
+        try:
+            torch.nn.init.xavier_normal_(param.data)
+        except:
+            pass
+
+model.pos_emb.weight.data[0, :] = 0
+model.train()
+
+import time
+import matplotlib.pyplot as plt
+
+bce_criterion = torch.nn.BCEWithLogitsLoss()
+adam_optimizer = torch.optim.Adam(model.parameters(), lr=args['lr'], betas=(0.9, 0.98), weight_decay=1e-4)
+
+best_val_ndcg, best_val_hr, best_val_mrr = 0.0, 0.0, 0.0
+best_test_ndcg, best_test_hr, best_test_mrr = 0.0, 0.0, 0.0
+T = 0.0
+t0 = time.time()
+
+patience = 5
+no_improvement_epochs = 0
+
+losses = []
+ndcgs = []
+hrs = []
+mrrs = []
+
+for epoch in range(1, args['num_epochs'] + 1):
+    for step in range(num_batch):  
+        u, seq, pos, neg = sampler.next_batch() 
+        u, seq, pos, neg = np.array(u), np.array(seq), np.array(pos), np.array(neg)
+        pos_logits, neg_logits = model(u, seq, pos, neg)
+        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args['device']), torch.zeros(neg_logits.shape, device=args['device'])
+        adam_optimizer.zero_grad()
+        indices = np.where(pos != 0)
+        loss = bce_criterion(pos_logits[indices], pos_labels[indices])
+        loss += bce_criterion(neg_logits[indices], neg_labels[indices])
+        for param in model.item_emb.parameters(): loss += args['l2_emb'] * torch.norm(param)
+        loss.backward()
+        adam_optimizer.step()
+
+    losses.append(loss.item())  
+    print(f"Loss in epoch {epoch} iteration {step}: {loss.item()}")
+
+    if epoch % 20 == 0:
+        model.eval()
+        t1 = time.time() - t0
+        T += t1
+        print('Evaluating', end='')
+        
+        t_test = evaluate(model, dataset, args)
+        t_valid = evaluate_valid(model, dataset, args)
+        
+        print(f'epoch:{epoch}, time: {T:.6f}(s), valid (NDCG@10: {t_valid[0]:.4f}, HR@10: {t_valid[1]:.4f}, MRR: {t_valid[2]:.4f}), '
+              f'test (NDCG@10: {t_test[0]:.4f}, HR@10: {t_test[1]:.4f}, MRR: {t_test[2]:.4f})')
+
+        ndcgs.append(t_valid[0])
+        hrs.append(t_valid[1])
+        mrrs.append(t_valid[2])
+    
+        if (t_valid[0] > best_val_ndcg or t_valid[1] > best_val_hr or t_valid[2] > best_val_mrr or
+            t_test[0] > best_test_ndcg or t_test[1] > best_test_hr or t_test[2] > best_test_mrr):
+            
+            best_val_ndcg = max(t_valid[0], best_val_ndcg)
+            best_val_hr = max(t_valid[1], best_val_hr)
+            best_val_mrr = max(t_valid[2], best_val_mrr)
+            best_test_ndcg = max(t_test[0], best_test_ndcg)
+            best_test_hr = max(t_test[1], best_test_hr)
+            best_test_mrr = max(t_test[2], best_test_mrr)
+            
+            no_improvement_epochs = 0
+        else:
+            no_improvement_epochs += 1
+    
+        if no_improvement_epochs >= patience:
+            print(f"Early stopping at epoch {epoch}. No improvement in validation NDCG/HR/MRR for {patience} epochs.")
+            break
+    
+        t0 = time.time()
+        model.train()
+
+fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+
+ax[0, 0].plot(range(1, len(losses) + 1), losses, label='Loss', color='red')
+ax[0, 0].set_xlabel('Epoch')
+ax[0, 0].set_ylabel('Loss')
+ax[0, 0].set_title('Loss vs Epoch')
+ax[0, 0].grid(True)
+
+ax[0, 1].plot(range(20, len(ndcgs) * 20 + 1, 20), ndcgs, label='NDCG@10', color='blue')
+ax[0, 1].set_xlabel('Epoch')
+ax[0, 1].set_ylabel('NDCG@10')
+ax[0, 1].set_title('NDCG@10 vs Epoch')
+ax[0, 1].grid(True)
+
+ax[1, 0].plot(range(20, len(hrs) * 20 + 1, 20), hrs, label='HR@10', color='green')
+ax[1, 0].set_xlabel('Epoch')
+ax[1, 0].set_ylabel('HR@10')
+ax[1, 0].set_title('HR@10 vs Epoch')
+ax[1, 0].grid(True)
+
+ax[1, 1].plot(range(20, len(mrrs) * 20 + 1, 20), mrrs, label='MRR', color='purple')
+ax[1, 1].set_xlabel('Epoch')
+ax[1, 1].set_ylabel('MRR')
+ax[1, 1].set_title('MRR vs Epoch')
+ax[1, 1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+print(f'Best Validation Metrics: '
+      f'NDCG@10: {best_val_ndcg:.4f}, HR@10: {best_val_hr:.4f}, MRR: {best_val_mrr:.4f}')
+print(f'Best Test Metrics: '
+      f'NDCG@10: {best_test_ndcg:.4f}, HR@10: {best_test_hr:.4f}, MRR: {best_test_mrr:.4f}')
+
+
+sampler.close()
