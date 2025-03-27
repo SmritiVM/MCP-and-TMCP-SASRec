@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset-path')
+parser.add_argument('--dataset-path', default='dataset')
 args = parser.parse_args()
 warnings.filterwarnings("ignore")
 
