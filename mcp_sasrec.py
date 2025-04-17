@@ -34,7 +34,7 @@ filtered_movies.head()
 
 # %%
 def tf_idf_matrix(movies_dataset):
-    tf_idf = TfidfVectorizer(analyzer = 'word', ngram_range=(1,1), min_df=0)
+    tf_idf = TfidfVectorizer(analyzer = 'word', ngram_range=(1,1))
     tfidf_matrix = tf_idf.fit_transform(movies_dataset['genres'])
     return tfidf_matrix
 tf_matrix = tf_idf_matrix(filtered_movies)
@@ -311,7 +311,7 @@ def evaluate(model, dataset, args):
             item_idx.append(t)
 
         predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
-        predictions = predictions[0]  
+        predictions = predictions[0]
 
         rank = predictions.argsort().argsort()[0].item()
 
@@ -324,6 +324,11 @@ def evaluate(model, dataset, args):
 
     return NDCG / valid_user, HT / valid_user, MRR / valid_user
 
+
+import time
+import numpy as np
+import random
+import copy
 
 def evaluate_valid(model, dataset, args):
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
@@ -355,8 +360,12 @@ def evaluate_valid(model, dataset, args):
             while t in rated: t = np.random.randint(1, itemnum + 1)
             item_idx.append(t)
 
+        start_time = time.time() 
         predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
         predictions = predictions[0]
+        end_time = time.time()  
+        predict_time = end_time - start_time
+        print(f"Time taken for prediction for user {u}: {predict_time:.6f} seconds")
 
         rank = predictions.argsort().argsort()[0].item()
 
@@ -367,7 +376,8 @@ def evaluate_valid(model, dataset, args):
             HT += 1
             MRR += 1 / (rank + 1)
 
-    return NDCG / valid_user, HT / valid_user, MRR / valid_user
+    return NDCG / valid_user, HT / valid_user, MRR / valid_user, predict_time
+
 
 """
 ### Model
@@ -509,7 +519,7 @@ args = {
     'maxlen': 50,
     'hidden_units': 50,
     'num_blocks': 2,
-    'num_epochs': 200,
+    'num_epochs': 1000,
     'num_heads': 1,
     'dropout_rate': 0.2,
     'l2_emb': 0.0,
@@ -555,6 +565,8 @@ losses = []
 ndcgs = []
 hrs = []
 mrrs = []
+prediction_times = []
+total_no_of_predictions = 0
 
 for epoch in range(1, args['num_epochs'] + 1):
     for step in range(num_batch):  
@@ -588,6 +600,8 @@ for epoch in range(1, args['num_epochs'] + 1):
         ndcgs.append(t_valid[0])
         hrs.append(t_valid[1])
         mrrs.append(t_valid[2])
+        prediction_times.append(t_valid[3])
+        total_no_of_predictions += 1
     
         if (t_valid[0] > best_val_ndcg or t_valid[1] > best_val_hr or t_valid[2] > best_val_mrr or
             t_test[0] > best_test_ndcg or t_test[1] > best_test_hr or t_test[2] > best_test_mrr):
@@ -643,6 +657,7 @@ print(f'Best Validation Metrics: '
       f'NDCG@10: {best_val_ndcg:.4f}, HR@10: {best_val_hr:.4f}, MRR: {best_val_mrr:.4f}')
 print(f'Best Test Metrics: '
       f'NDCG@10: {best_test_ndcg:.4f}, HR@10: {best_test_hr:.4f}, MRR: {best_test_mrr:.4f}')
+print('Average Prediction Time: ', sum(prediction_times)/total_no_of_predictions)
 
 
 sampler.close()
